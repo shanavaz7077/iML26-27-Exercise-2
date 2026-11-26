@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 from sklearn.datasets import fetch_openml
+from ucimlrepo import fetch_ucirepo
 
 # OpenML downloads are cached here, relative to the current working directory.
 DATA_HOME = Path("data")
@@ -51,3 +52,41 @@ def load_bike_sharing(data_home: str | Path = DATA_HOME) -> Dataset:
     X = pd.get_dummies(bunch.data, drop_first=True, dtype=float)
     y = bunch.target.astype(float).rename("count")
     return Dataset(name="bike_sharing", X=X.astype(float), y=y)
+
+
+def load_concrete_strength() -> Dataset:
+    """Load the UCI Concrete Compressive Strength dataset (UCI id 165).
+
+    :return: The preprocessed Concrete Compressive Strength dataset.
+    :rtype: Dataset
+    """
+    dataset = fetch_ucirepo(id=165)
+    features = dataset.data.features
+    targets = dataset.data.targets
+
+    if features.shape != (1030, 8):
+        raise ValueError(f"Expected 1030 rows and 8 features, got {features.shape}")
+    if targets.shape != (1030, 1):
+        raise ValueError(f"Expected one target column with 1030 rows, got {targets.shape}")
+
+    try:
+        X = features.apply(pd.to_numeric, errors="raise").astype(float)
+        y = pd.to_numeric(targets.iloc[:, 0], errors="raise").astype(float)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Concrete strength features and target must be numeric") from error
+
+    if X.isna().any().any() or y.isna().any():
+        raise ValueError("Concrete strength data must not contain missing values")
+
+    X.columns = [
+        "Cement",
+        "Blast furnace slag",
+        "Fly ash",
+        "Water",
+        "Superplasticizer",
+        "Coarse aggregate",
+        "Fine aggregate",
+        "Age",
+    ]
+    y = y.rename("strength_mpa")
+    return Dataset(name="concrete_strength", X=X, y=y)
