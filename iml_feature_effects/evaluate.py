@@ -13,6 +13,7 @@ from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from iml_feature_effects.data import Dataset
 from iml_feature_effects.effects import EffectProperty, FeatureEffect
+from iml_feature_effects.models import get_tree_depth_candidates
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,47 @@ def split_dataset(dataset: Dataset, seed: int = 0, group_aware: bool = False) ->
         y_train=dataset.y.iloc[train_positions],
         y_val=dataset.y.iloc[val_positions],
         y_test=dataset.y.iloc[test_positions],
+    )
+
+
+def evaluate_tree_depth_sweep(dataset: Dataset, split: DatasetSplit) -> pd.DataFrame:
+    """Fit decision trees on training data and score them on train and validation only.
+
+    :param dataset: Dataset being evaluated; used to label result rows.
+    :param split: Existing train/validation/test partitions. The test partition is not accessed.
+    :return: One row per maximum-depth candidate, including train and validation R².
+    """
+    rows = []
+    for max_depth, model in get_tree_depth_candidates().items():
+        model.fit(split.X_train, split.y_train)
+        train_r2 = r2_score(split.y_train, model.predict(split.X_train))
+        val_r2 = r2_score(split.y_val, model.predict(split.X_val))
+        rows.append(
+            {
+                "dataset": dataset.name,
+                "max_depth": "unlimited" if max_depth is None else max_depth,
+                "actual_depth": model.get_depth(),
+                "leaf_count": model.get_n_leaves(),
+                "train_samples": len(split.X_train),
+                "val_samples": len(split.X_val),
+                "train_r2": train_r2,
+                "val_r2": val_r2,
+                "train_val_gap": train_r2 - val_r2,
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "dataset",
+            "max_depth",
+            "actual_depth",
+            "leaf_count",
+            "train_samples",
+            "val_samples",
+            "train_r2",
+            "val_r2",
+            "train_val_gap",
+        ],
     )
 
 

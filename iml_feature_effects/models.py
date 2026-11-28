@@ -17,6 +17,7 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
 
 
 class SubsampledRegressor(RegressorMixin, BaseEstimator):
@@ -93,4 +94,12 @@ def get_models(seed: int = 0) -> dict[str, BaseEstimator]:
             n_samples=20,
             random_state=seed,
         ),
+    }
+
+
+def get_tree_depth_candidates() -> dict[int | None, DecisionTreeRegressor]:
+    """Return unfitted decision trees for a controlled maximum-depth sweep."""
+    return {
+        depth: DecisionTreeRegressor(max_depth=depth, random_state=0)
+        for depth in (1, 2, 3, 4, 6, 8, 12, None)
     }
