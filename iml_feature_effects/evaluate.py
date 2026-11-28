@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, clone
-from sklearn.metrics import r2_score
+from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from iml_feature_effects.data import Dataset
@@ -118,6 +118,191 @@ def evaluate_tree_depth_sweep(dataset: Dataset, split: DatasetSplit) -> pd.DataF
             "train_r2",
             "val_r2",
             "train_val_gap",
+        ],
+    )
+
+
+def select_tree_representatives(sweep: pd.DataFrame, tolerance: float = 0.01) -> pd.DataFrame:
+    """Select underfit, well-fit, and overfit depths using train/validation sweep metrics.
+
+    Underfit is the simplest depth-1 candidate and is a relative label. Well-fit is the
+    shallowest candidate within ``tolerance`` absolute validation R² of the best observed value.
+    The tolerance is exploratory and practical, not a statistical guarantee. Overfit is the
+    eligible deeper candidate with the largest train/validation R² gap; ties select the shallower
+    depth. If no deeper candidate has higher training R² and lower validation R² than the
+    well-fit candidate, the overfit selection is explicitly marked ``not_selected``.
+
+    :param sweep: Output of :func:`evaluate_tree_depth_sweep`, with no test metrics required.
+    :param tolerance: Allowed validation R² distance from the best candidate.
+    :return: Three categorized selection rows per dataset, including an explicit missing overfit
+        selection when no candidate meets the criteria.
+    """
+    required = {"dataset", "max_depth", "actual_depth", "leaf_count", "train_r2", "val_r2", "train_val_gap"}
+    missing_columns = required.difference(sweep.columns)
+    if missing_columns:
+        raise ValueError(f"Sweep table is missing required columns: {sorted(missing_columns)}")
+    if tolerance < 0:
+        raise ValueError("tolerance must be non-negative")
+
+    def depth_order(depth: object) -> float:
+        if depth is None or depth == "unlimited":
+            return float("inf")
+        if isinstance(depth, (int, np.integer)) and not isinstance(depth, bool):
+            return float(depth)
+        raise ValueError(f"Unrecognized max_depth value: {depth!r}")
+
+    selected_rows = []
+    selection_rules = {
+        "underfit": "max_depth=1; simplest candidate, interpreted as relative underfitting",
+        "well_fit": (
+            f"shallowest candidate within {tolerance:.2f} absolute validation R² "
+            "of the best; exploratory tolerance, not a statistical guarantee"
+        ),
+        "overfit": (
+            "largest train-validation R² gap among deeper candidates with higher train R² "
+            "and lower validation R² than the well-fit candidate; ties select the shallower depth"
+        ),
+    }
+
+    for dataset_name, candidates in sweep.groupby("dataset", sort=False):
+        if candidates["max_depth"].duplicated().any():
+            raise ValueError(f"Sweep contains duplicate depth candidates for {dataset_name}")
+
+        underfit_rows = candidates.loc[candidates["max_depth"].eq(1)]
+        if underfit_rows.empty:
+            raise ValueError(f"Sweep has no max_depth=1 candidate for {dataset_name}")
+        underfit = underfit_rows.iloc[0]
+
+        best_validation = candidates["val_r2"].max()
+        within_tolerance = candidates.loc[(best_validation - candidates["val_r2"]).abs() <= tolerance]
+        well_fit = within_tolerance.iloc[
+            np.argmin([depth_order(depth) for depth in within_tolerance["max_depth"]])
+        ]
+
+        selected_rows.extend(
+            [
+                {
+                    **underfit.to_dict(),
+                    "dataset": dataset_name,
+                    "fit_category": "underfit",
+                    "selection_rule": selection_rules["underfit"],
+                },
+                {
+                    **well_fit.to_dict(),
+                    "dataset": dataset_name,
+                    "fit_category": "well_fit",
+                    "selection_rule": selection_rules["well_fit"],
+                },
+            ]
+        )
+
+        overfit_candidates = candidates.loc[
+            candidates["max_depth"].map(depth_order).gt(depth_order(well_fit["max_depth"]))
+            & candidates["train_r2"].gt(well_fit["train_r2"])
+            & candidates["val_r2"].lt(well_fit["val_r2"])
+        ]
+        if overfit_candidates.empty:
+            selected_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "max_depth": "not_selected",
+                    "actual_depth": pd.NA,
+                    "leaf_count": pd.NA,
+                    "train_r2": pd.NA,
+                    "val_r2": pd.NA,
+                    "train_val_gap": pd.NA,
+                    "fit_category": "overfit",
+                    "selection_rule": (
+                        "No deeper candidate has both higher train R² and lower validation R² "
+                        "than the well-fit candidate"
+                    ),
+                }
+            )
+        else:
+            overfit_candidates = overfit_candidates.assign(
+                _depth_order=overfit_candidates["max_depth"].map(depth_order)
+            )
+            overfit = overfit_candidates.sort_values(
+                ["train_val_gap", "_depth_order"],
+                ascending=[False, True],
+                kind="stable",
+            ).iloc[0]
+            selected_rows.append(
+                {
+                    **overfit.drop(labels="_depth_order").to_dict(),
+                    "dataset": dataset_name,
+                    "fit_category": "overfit",
+                    "selection_rule": selection_rules["overfit"],
+                }
+            )
+
+    columns = [
+        "dataset",
+        "fit_category",
+        "max_depth",
+        "actual_depth",
+        "leaf_count",
+        "train_r2",
+        "val_r2",
+        "train_val_gap",
+        "selection_rule",
+    ]
+    return pd.DataFrame(selected_rows, columns=columns)
+
+
+def evaluate_selected_tree_models(
+    dataset: Dataset,
+    split: DatasetSplit,
+    selections: pd.DataFrame,
+) -> pd.DataFrame:
+    """Fit selected trees on training data and evaluate each once on the test partition."""
+    dataset_selections = selections.loc[selections["dataset"].eq(dataset.name)]
+    selected = dataset_selections.loc[dataset_selections["max_depth"].ne("not_selected")]
+    candidates = get_tree_depth_candidates()
+    rows = []
+
+    for selection in selected.itertuples(index=False):
+        max_depth = None if selection.max_depth == "unlimited" else int(selection.max_depth)
+        model = clone(candidates[max_depth])
+        model.fit(split.X_train, split.y_train)
+
+        train_predictions = model.predict(split.X_train)
+        val_predictions = model.predict(split.X_val)
+        test_predictions = model.predict(split.X_test)
+        rows.append(
+            {
+                "dataset": dataset.name,
+                "fit_category": selection.fit_category,
+                "max_depth": selection.max_depth,
+                "selection_rule": selection.selection_rule,
+                "actual_depth": model.get_depth(),
+                "leaf_count": model.get_n_leaves(),
+                "train_samples": len(split.X_train),
+                "val_samples": len(split.X_val),
+                "test_samples": len(split.X_test),
+                "train_r2": r2_score(split.y_train, train_predictions),
+                "val_r2": r2_score(split.y_val, val_predictions),
+                "test_r2": r2_score(split.y_test, test_predictions),
+                "test_mae": mean_absolute_error(split.y_test, test_predictions),
+            }
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "dataset",
+            "fit_category",
+            "max_depth",
+            "selection_rule",
+            "actual_depth",
+            "leaf_count",
+            "train_samples",
+            "val_samples",
+            "test_samples",
+            "train_r2",
+            "val_r2",
+            "test_r2",
+            "test_mae",
         ],
     )
 
