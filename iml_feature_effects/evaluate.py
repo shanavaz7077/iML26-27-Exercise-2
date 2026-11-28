@@ -3,14 +3,81 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, clone
 from sklearn.metrics import r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from iml_feature_effects.data import Dataset
 from iml_feature_effects.effects import EffectProperty, FeatureEffect
+
+
+@dataclass(frozen=True)
+class DatasetSplit:
+    """Train, validation, and test partitions of a :class:`Dataset`."""
+
+    X_train: pd.DataFrame
+    X_val: pd.DataFrame
+    X_test: pd.DataFrame
+    y_train: pd.Series
+    y_val: pd.Series
+    y_test: pd.Series
+
+
+def split_dataset(dataset: Dataset, seed: int = 0, group_aware: bool = False) -> DatasetSplit:
+    """Split a dataset reproducibly into approximately 60/20/20 partitions.
+
+    Set ``group_aware=True`` to keep rows with identical feature values together. This is
+    appropriate for Concrete Strength and deliberately groups on ``X`` only, not the target.
+
+    :param dataset: Dataset whose feature and target rows are aligned.
+    :param seed: Random seed used by both split stages.
+    :param group_aware: Whether to keep exact duplicate feature configurations together.
+    :return: A :class:`DatasetSplit` preserving the original pandas types, indices, and columns.
+    :raises ValueError: If feature and target rows are not aligned.
+    """
+    if len(dataset.X) != len(dataset.y) or not dataset.X.index.equals(dataset.y.index):
+        raise ValueError("Dataset features and target must have aligned rows and indices")
+
+    row_positions = np.arange(len(dataset.X))
+    if group_aware:
+        groups = pd.MultiIndex.from_frame(dataset.X).factorize(sort=False)[0]
+        first_split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+        trainval_positions, test_positions = next(
+            first_split.split(dataset.X, dataset.y, groups=groups)
+        )
+
+        second_split = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
+        train_relative, val_relative = next(
+            second_split.split(
+                dataset.X.iloc[trainval_positions],
+                dataset.y.iloc[trainval_positions],
+                groups=groups[trainval_positions],
+            )
+        )
+        train_positions = trainval_positions[train_relative]
+        val_positions = trainval_positions[val_relative]
+    else:
+        trainval_positions, test_positions = train_test_split(
+            row_positions, test_size=0.2, random_state=seed
+        )
+        train_relative, val_relative = train_test_split(
+            np.arange(len(trainval_positions)), test_size=0.25, random_state=seed
+        )
+        train_positions = trainval_positions[train_relative]
+        val_positions = trainval_positions[val_relative]
+
+    return DatasetSplit(
+        X_train=dataset.X.iloc[train_positions],
+        X_val=dataset.X.iloc[val_positions],
+        X_test=dataset.X.iloc[test_positions],
+        y_train=dataset.y.iloc[train_positions],
+        y_val=dataset.y.iloc[val_positions],
+        y_test=dataset.y.iloc[test_positions],
+    )
 
 
 def evaluate(
